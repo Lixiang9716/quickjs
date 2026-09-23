@@ -2533,6 +2533,24 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                               JS_DupValueRT(ctx->rt, ctx->rt->async_context));
 }
 
+/* __asyncContextGet/Set — the JS-visible face of the slot, bound by
+ * JS_AddIntrinsicAsyncContext (the intrinsic's own source consumes them;
+ * embedder shims — the spike's AsyncLocalStorage translation — read/write
+ * the same slot). */
+static JSValue js_async_context_get(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    return JS_GetAsyncContext(JS_GetRuntime(ctx));
+}
+
+static JSValue js_async_context_set(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "__asyncContextSet needs a value");
+    JS_SetAsyncContext(JS_GetRuntime(ctx), (JSValue)argv[0]);
+    return JS_UNDEFINED;
+}
+
 /* The async-context value (engine side of TC39 proposal-async-context):
  * JS_GetAsyncContext returns a NEW reference; JS_SetAsyncContext keeps its
  * own reference (dups the value) and frees the previous one. Embedders bind
@@ -2942,6 +2960,105 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     return ctx;
 }
 
+
+/* AsyncContext — the TC39 proposal-async-context face over the engine's
+ * async-context slot (fork divergence #2). Defined by evaluating this
+ * source at context creation; the engine's job/reaction snapshot machinery
+ * provides the propagation (a JS-only polyfill cannot: `await` continuations
+ * never pass through the visible Promise.prototype.then). */
+static const char js_async_context_source[] =
+"\n\
+(function () {\n\
+  \"use strict\";\n\
+  // The engine slot accessors (bound as C globals next to this intrinsic):\n\
+  // __asyncContextGet() -> the current context value (a reference)\n\
+  // __asyncContextSet(v) -> replace it. The engine snapshots the value into\n\
+  // every enqueued job and restores it around execution; promise reactions\n\
+  // capture at ATTACH time. Context representation: an immutable-by-\n\
+  // convention Map from Variable instances to values (copy-on-write —\n\
+  // Variable instances are object keys, so a plain object cannot serve).\n\
+  const current = () => { const v = globalThis.__asyncContextGet(); return v === undefined ? new Map() : v; };\n\
+  const swap = (next, fn, ...args) => {\n\
+    const saved = current();\n\
+    globalThis.__asyncContextSet(next);\n\
+    try { return fn(...args); } finally { globalThis.__asyncContextSet(saved); }\n\
+  };\n\
+  const withEntry = (variable, value, fn, ...args) => {\n\
+    const next = new Map(current());\n\
+    next.set(variable, value);\n\
+    return swap(next, fn, ...args);\n\
+  };\n\
+\n\
+  class Variable {\n\
+    #name;\n\
+    #defaultValue;\n\
+    constructor(name = \"\", defaultValue = undefined) {\n\
+      if (new.target === undefined) throw new TypeError(\"Variable must be constructed with new\");\n\
+      if (typeof name !== \"string\") throw new TypeError(\"Variable name must be a string\");\n\
+      this.#name = name;\n\
+      this.#defaultValue = defaultValue;\n\
+    }\n\
+    get name() { return this.#name; }\n\
+    get defaultValue() { return this.#defaultValue; }\n\
+    get() {\n\
+      const ctx = current();\n\
+      return ctx.has(this) ? ctx.get(this) : this.#defaultValue;\n\
+    }\n\
+    set(value, fn, ...args) {\n\
+      if (typeof fn !== \"function\") throw new TypeError(\"Variable.set requires a function\");\n\
+      return withEntry(this, value, fn, ...args);\n\
+    }\n\
+    wrap(fn) {\n\
+      if (typeof fn !== \"function\") throw new TypeError(\"Variable.wrap requires a function\");\n\
+      const captured = current();\n\
+      const variable = this;\n\
+      return function wrapped(...args) {\n\
+        const valueHere = captured.has(variable) ? captured.get(variable) : variable.#defaultValue;\n\
+        return withEntry(variable, valueHere, fn, ...args);\n\
+      };\n\
+    }\n\
+  }\n\
+\n\
+  class Snapshot {\n\
+    #context;\n\
+    constructor(context) { this.#context = context; }\n\
+    get context() { return this.#context; }\n\
+  }\n\
+\n\
+  const AsyncContext = {\n\
+    Variable,\n\
+    snapshot() { return new Snapshot(current()); },\n\
+    wrap(fn, snapshot) {\n\
+      if (typeof fn !== \"function\") throw new TypeError(\"AsyncContext.wrap requires a function\");\n\
+      const captured = snapshot === undefined ? current() : snapshot.context;\n\
+      return function wrapped(...args) { return swap(captured, fn, ...args); };\n\
+    },\n\
+  };\n\
+  Object.freeze(AsyncContext);\n\
+  Object.defineProperty(globalThis, \"AsyncContext\", { value: AsyncContext, writable: false, configurable: false });\n\
+})();\n\
+";
+
+static int JS_AddIntrinsicAsyncContext(JSContext *ctx)
+{
+    JSValue get_fn = JS_NewCFunction(ctx, js_async_context_get, "__asyncContextGet", 0);
+    JS_SetPropertyStr(ctx, ctx->global_obj, "__asyncContextGet", get_fn);
+    JSValue set_fn = JS_NewCFunction(ctx, js_async_context_set, "__asyncContextSet", 1);
+    JS_SetPropertyStr(ctx, ctx->global_obj, "__asyncContextSet", set_fn);
+    JSValue ret = JS_Eval(ctx, js_async_context_source,
+                          sizeof(js_async_context_source) - 1,
+                          "<async-context>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(ret)) {
+        JSValue exc = JS_GetException(ctx);
+        fprintf(stderr, "quickjs: AsyncContext intrinsic failed\n");
+        JS_FreeValue(ctx, exc);
+        JS_FreeValue(ctx, ret);
+        return -1;
+    }
+    JS_FreeValue(ctx, ret);
+    return 0;
+}
+
 JSContext *JS_NewContext(JSRuntime *rt)
 {
     JSContext *ctx;
@@ -2960,7 +3077,8 @@ JSContext *JS_NewContext(JSRuntime *rt)
         JS_AddIntrinsicPromise(ctx) ||
         JS_AddIntrinsicWeakRef(ctx) ||
         JS_AddIntrinsicAToB(ctx) ||
-        JS_AddPerformance(ctx)) {
+        JS_AddPerformance(ctx) ||
+        JS_AddIntrinsicAsyncContext(ctx)) {
         JS_FreeContext(ctx);
         return NULL;
     }
