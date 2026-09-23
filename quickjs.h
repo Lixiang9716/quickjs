@@ -1248,6 +1248,12 @@ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                             int argc, JSValueConst *argv);
 
 JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
+/* Async-context (engine side of TC39 proposal-async-context): the current
+ * context value is snapshotted into every enqueued job and restored around
+ * its execution. JS_GetAsyncContext returns a new reference;
+ * JS_SetAsyncContext keeps its own reference (dups) and frees the previous. */
+JS_EXTERN JSValue JS_GetAsyncContext(JSRuntime *rt);
+JS_EXTERN void JS_SetAsyncContext(JSRuntime *rt, JSValue value);
 JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 JS_EXTERN int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 

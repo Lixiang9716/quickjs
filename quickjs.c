@@ -393,6 +393,14 @@ struct JSRuntime {
 
     struct list_head job_list; /* list of JSJobEntry.link */
 
+    /* Async-context (TC39 proposal-async-context shape, engine side): the
+     * current context value, snapshotted into every enqueued job and
+     * restored around its execution — the propagation Node implements
+     * natively (async_hooks) and JS-level Promise patches cannot (await
+     * bypasses the visible .then). Held by ordinary refcount; cycle
+     * collection sees the external ref, so no GC marking is needed. */
+    JSValue async_context;
+
     bool module_normalize_has_attr;
     union {
         JSModuleNormalizeFunc *module_normalize_func;
@@ -1074,6 +1082,7 @@ typedef struct JSJobEntry {
     struct list_head link;
     JSContext *ctx;
     JSJobFunc *job_func;
+    JSValue async_context; /* snapshot at enqueue; restored while running */
     int argc;
     JSValue argv[];
 } JSJobEntry;
@@ -2370,6 +2379,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     JS_UpdateStackTop(rt);
 
     rt->current_exception = JS_UNINITIALIZED;
+    rt->async_context = JS_UNDEFINED;
 
     return rt;
  fail:
@@ -2486,8 +2496,10 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 }
 
 /* return 0 if OK, < 0 if exception */
-int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
-                  int argc, JSValueConst *argv)
+/* The shared enqueue: `async_context` ownership is TAKEN by the job entry. */
+static int js_enqueue_job_ctx(JSContext *ctx, JSJobFunc *job_func,
+                              int argc, JSValueConst *argv,
+                              JSValue async_context)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2496,16 +2508,45 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     assert(!rt->in_free);
 
     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
-    if (!e)
+    if (!e) {
+        JS_FreeValueRT(rt, async_context);
         return -1;
+    }
     e->ctx = ctx;
     e->job_func = job_func;
+    e->async_context = async_context;
     e->argc = argc;
     for(i = 0; i < argc; i++) {
         e->argv[i] = js_dup(argv[i]);
     }
     list_add_tail(&e->link, &rt->job_list);
     return 0;
+}
+
+int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                  int argc, JSValueConst *argv)
+{
+    /* Snapshot the CURRENT async context (attach-time == now for the
+     * direct callers; promise reactions with their own captured context
+     * go through js_enqueue_job_ctx). */
+    return js_enqueue_job_ctx(ctx, job_func, argc, argv,
+                              JS_DupValueRT(ctx->rt, ctx->rt->async_context));
+}
+
+/* The async-context value (engine side of TC39 proposal-async-context):
+ * JS_GetAsyncContext returns a NEW reference; JS_SetAsyncContext keeps its
+ * own reference (dups the value) and frees the previous one. Embedders bind
+ * these to JS (the spike host exposes them as __asyncContextGet/Set). */
+JSValue JS_GetAsyncContext(JSRuntime *rt)
+{
+    return JS_DupValueRT(rt, rt->async_context);
+}
+
+void JS_SetAsyncContext(JSRuntime *rt, JSValue value)
+{
+    JSValue old = rt->async_context;
+    rt->async_context = JS_DupValueRT(rt, value);
+    JS_FreeValueRT(rt, old);
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
@@ -2539,7 +2580,17 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->ctx;
-    res = e->job_func(e->ctx, e->argc, vc(e->argv));
+    {
+        /* Run the job under its snapshotted async context (the propagation
+         * point); restore the previous context afterwards. Ownership of the
+         * snapshot moves into rt->async_context; a JS-side setter during the
+         * job replaces (and frees) it, so free whatever remains here. */
+        JSValue saved_context = rt->async_context;
+        rt->async_context = e->async_context;
+        res = e->job_func(e->ctx, e->argc, vc(e->argv));
+        JS_FreeValue(ctx, rt->async_context);
+        rt->async_context = saved_context;
+    }
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
@@ -2644,9 +2695,11 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
+    JS_FreeValueRT(rt, rt->async_context);
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        JS_FreeValueRT(rt, e->async_context);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
         js_free_rt(rt, e);
@@ -55512,6 +55565,11 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    /* Async context captured at ATTACH time (the TC39 semantics: the
+     * continuation belongs to the code that created it). The resolve-time
+     * enqueue hands it to the job — the resolving site (often a C host
+     * event) has its own, unrelated context. */
+    JSValue async_context;
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
@@ -55580,6 +55638,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
     JS_FreeValueRT(rt, rd->handler);
     js_free_rt(rt, rd);
+    JS_FreeValueRT(rt, rd->async_context);
 }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_PROMISE
@@ -55682,7 +55741,15 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = js_bool(is_reject);
         args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        /* The continuation runs under the context captured when the
+         * reaction was ATTACHED — not this (possibly C-host) resolve
+         * site's context. Ownership moves into the job entry; the free
+         * below then sees UNDEFINED. */
+        {
+            JSValue ctx_taken = rd->async_context;
+            rd->async_context = JS_UNDEFINED;
+            js_enqueue_job_ctx(ctx, promise_reaction_job, 5, args, ctx_taken);
+        }
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -56488,6 +56555,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = js_dup(handler);
+        rd->async_context = JS_DupValueRT(ctx->rt, ctx->rt->async_context);
         rd_array[i] = rd;
     }
 
