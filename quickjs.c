@@ -56076,6 +56076,14 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
             JS_MarkValue(rt, rd->handler, mark_func);
+            /* The reaction's captured async-context value (duplicated at
+             * attach time by perform_promise_then) is held by this C
+             * record outside the GC graph; unmarked, it reads as an
+             * eternal external root and pins the frame arrays through
+             * JS_FreeRuntime (assert list_empty(&rt->gc_obj_list)).
+             * Mark it so the capture dies with the reaction record.
+             * (Lixiang9716/dsh-mobile#239) */
+            JS_MarkValue(rt, rd->async_context, mark_func);
         }
     }
     JS_MarkValue(rt, s->promise_result, mark_func);
