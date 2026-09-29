@@ -55755,8 +55755,8 @@ static void promise_reaction_data_free(JSRuntime *rt,
     JS_FreeValueRT(rt, rd->resolving_funcs[0]);
     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
     JS_FreeValueRT(rt, rd->handler);
-    js_free_rt(rt, rd);
     JS_FreeValueRT(rt, rd->async_context);
+    js_free_rt(rt, rd);
 }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_PROMISE
